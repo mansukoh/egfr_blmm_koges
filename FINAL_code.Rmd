@@ -1,0 +1,1431 @@
+---
+title: "thesis_MinjaeJung_Code"
+author: "minjaejung"
+date: "2025-11-01"
+output: html_document
+---
+# I. Data Preparation
+```{r}
+# loading data
+library(dplyr)
+library(readr)
+base_dir <- "c:/temp"
+train_df1<-read_csv(file.path(base_dir, 'train_df.csv'))
+test_df1<-read_csv(file.path(base_dir, 'test_df.csv'))
+train_df1$X<-NULL
+test_df1$X<-NULL
+
+# load combined_data for clinical application
+combined_data<-read_csv('/temp/combined_df.csv')
+
+###################### transforming for train data ##############################
+factor_vars <- c(
+    "SEX",
+    "DM_hybrid", "HTN_hybrid",
+    "ID"
+)
+# setting variable list( whole variable )
+all_vars <- names(train_df1)
+
+# numeric variable list( except for factor variable )
+numeric_vars <- setdiff(all_vars, c("ID", factor_vars))
+
+# missing value list
+na_values <- c(99999, 77777, 66666)
+
+# 1. transforming the type of variable
+for (v in factor_vars) {
+    if (v %in% names(train_df1)) {
+        train_df1[[v]] <- as.factor(train_df1[[v]])
+    }
+}
+for (v in numeric_vars) {
+    if (v %in% names(train_df1)) {
+        train_df1[[v]] <- as.numeric(train_df1[[v]])
+        train_df1[[v]][train_df1[[v]] %in% na_values] <- NA  # dealing with missing data
+    }
+}
+
+# transforming for ordinal variable
+ordered_levels_list <- list(
+    HTN_hybrid = c("Normal", "Prehypertension", "Hypertension"),
+    DM_hybrid = c("Normal", "Prediabetes", "Diabetes")
+    
+)
+
+# repeat
+for (var in names(ordered_levels_list)) {
+    if (var %in% names(train_df1)) {
+        train_df1[[var]] <- factor(
+            train_df1[[var]],
+            levels = ordered_levels_list[[var]],
+            ordered = TRUE
+        )
+    }
+}
+summary(train_df1)
+str(train_df1)
+
+###################### transforming for test data ##############################
+factor_vars <- c(
+    "SEX",
+    "DM_hybrid", "HTN_hybrid",
+    "ID"
+)
+
+# setting variable list( whole variable )
+all_vars <- names(train_df1)
+
+# numeric variable list( except for factor variable )
+numeric_vars <- setdiff(all_vars, c("ID", factor_vars))
+
+# missing value list
+na_values <- c(99999, 77777, 66666)
+
+
+# 1. transforming the type of variable
+for (v in factor_vars) {
+    if (v %in% names(test_df1)) {
+        test_df1[[v]] <- as.factor(test_df1[[v]])
+    }
+}
+for (v in numeric_vars) {
+    if (v %in% names(test_df1)) {
+        test_df1[[v]] <- as.numeric(test_df1[[v]])
+        test_df1[[v]][test_df1[[v]] %in% na_values] <- NA  
+    }
+}
+
+# transforming for ordinal variable
+ordered_levels_list <- list(
+    HTN_hybrid = c("Normal", "Prehypertension", "Hypertension"),
+    DM_hybrid = c("Normal", "Prediabetes", "Diabetes")
+    
+)
+
+# repeat
+for (var in names(ordered_levels_list)) {
+    if (var %in% names(test_df1)) {
+        test_df1[[var]] <- factor(
+            test_df1[[var]],
+            levels = ordered_levels_list[[var]],
+            ordered = TRUE
+        )
+    }
+}
+summary(test_df1)
+str(test_df1)
+
+
+```
+
+# II. Interaction Term Selection (Horseshoe Prior)
+##    Fit horseshoe model (inter_hs)
+```{r}
+# ------------------------------------------------------------------------------
+# Goal: Select significant interaction terms (covariate x TIME) using a
+# horseshoe prior, which performs simultaneous shrinkage and variable selection.
+#
+# All 8 candidate covariates (SEX, AGE, BMI, SYSMEAN, BUN, URICACID,
+# HOMOCYST_log, CPEPTIDE) are included as main effects AND interacted with
+# TIME (RelativeYear). The horseshoe aggressively shrinks noise interactions
+# toward zero while letting genuine signals escape through heavy tails.
+#
+# Note: `SYSMEAN` in the code corresponds to `SBP` (systolic blood pressure)
+# in the manuscript; the two names refer to the same variable.
+# ------------------------------------------------------------------------------
+
+library(brms)
+# Full model formula with ALL 8 candidate interaction terms.
+
+formm_hs <- bf(
+  eGFR ~ SEX + AGE + BMI + SYSMEAN + BUN + URICACID + 
+         HOMOCYST_log + CPEPTIDE +
+         RelativeYear:SEX +
+         RelativeYear:AGE +
+         RelativeYear:BMI +
+         RelativeYear:SYSMEAN +
+         RelativeYear:BUN +
+         RelativeYear:URICACID +
+         RelativeYear:HOMOCYST_log +
+         RelativeYear:CPEPTIDE +
+         (1 + RelativeYear | ID)
+)
+# Prior specification.
+# - class="b": horseshoe prior on ALL fixed-effect coefficients (main + interactions).
+#   brms default horseshoe() uses df=1 for the local scales lambda_k,
+#   equivalent to Half-Cauchy(0,1). The global scale tau also follows
+#   Half-Cauchy(0,1).
+# - Intercept: weakly informative heavy-tailed t3(0, 10).
+# - sd (random-effect SDs): Half-t3(0, 5); avoids the near-zero pathology of
+#   Inverse-Gamma priors on variance components (Gelman, 2006).
+# - cor: LKJ(eta=2); mild regularization against extreme correlations (|rho| -> 1).
+# - sigma (residual SD): Half-t3(0, 10).
+prior_hs <- c(
+  set_prior("horseshoe()", class = "b"),
+  set_prior("student_t(3,0,10)", class = "Intercept"),
+  set_prior("student_t(3,0,5)", class = "sd"),
+  set_prior("lkj(2)",           class = "cor"),
+  set_prior("student_t(3,0,10)", class = "sigma")
+)
+
+# Fitting wrapper.
+# `save_pars = save_pars(all = TRUE)` is REQUIRED: it retains the local
+# shrinkage parameters hs_local[k], which are needed in the next chunk to
+# compute the posterior shrinkage factor kappa_k = 1 / (1 + lambda_k^2).
+#
+# Sampler settings: iter=10000 / warmup=2500 (more than the main model)
+# because the funnel geometry of a global-local shrinkage hierarchy needs
+# extra warmup. adapt_delta=0.99 reduces divergent transitions.
+
+fit_model <- function(formula, data_input, priors_input) {
+    brm(
+        formula = formula,
+        data = data_input, 
+        prior = priors_input,
+        family = gaussian(),
+        chains = 4, cores = 2,
+        iter = 10000, warmup = 2500,
+        seed = 123,
+        control = list(adapt_delta = 0.99, max_treedepth = 12),
+        save_pars = save_pars(all = TRUE)
+
+    )
+}
+inter_hs<-fit_model(formm_hs, train_df1, prior_hs)
+summary(inter_hs)
+# saveRDS(inter_hs,'/Users/minjaejung/Desktop/2026/학술지/Revision_0413/inter_hs.rds')
+```
+## Shrinkage factor & CrI based selection results
+```{r}
+# ------------------------------------------------------------------------------
+# Compute three selection metrics for each candidate interaction:
+#   (1) 95% CrI excludes zero (signed agreement of Q2.5 and Q97.5)
+#   (2) Posterior mean of the shrinkage factor kappa_k = 1 / (1 + lambda_k^2)
+#       Small kappa  ==> data resists global shrinkage ==> genuine signal.
+#       kappa near 1 ==> coefficient effectively pulled to zero.
+#   (3) Signal-to-noise ratio |E[gamma_k|Y]| / SD(gamma_k|Y)
+#
+# The paper retains an interaction when all three hold jointly. In this
+# dataset, the selected 3 interactions (SEX, URICACID, CPEPTIDE x TIME)
+# pass all three criteria, and the excluded 5 fail all three. The final
+# filter below uses only conditions (1) and (2); condition (3) is
+# automatically satisfied for the retained set.
+# ------------------------------------------------------------------------------
+
+
+library(dplyr)
+library(tibble)
+library(posterior)
+
+# 1. Fixed-effect summaries (posterior mean, SE, 95% CrI).
+fixef_res <- fixef(inter_hs) %>%
+  as.data.frame() %>%
+  rownames_to_column("Parameter")
+
+# 2. Build an index map between fixed-effect names and hs_local[k].
+#    brms stores local scales as hs_local[1], hs_local[2], ... in the order
+#    of columns of the design matrix X (excluding the intercept).
+standata_info <- make_standata(formm_hs, data = train_df1, prior = prior_hs)
+hs_varnames <- colnames(standata_info$X)[-1] # Exclude Intercept
+
+# Keep only interaction terms (names containing ":")
+interaction_vars <- grep(":", hs_varnames, value = TRUE)
+
+# 3. Posterior draws
+post_draws <- as_draws_df(inter_hs)
+
+# 4. Per-interaction metrics
+results_list <- lapply(interaction_vars, function(var_name) {
+  # Position of this interaction in the hs_local vector.
+  idx <- which(hs_varnames == var_name)
+  
+  # Local scale draws for this coefficient: lambda_k.
+  # (Column naming may differ across brms versions; guard with a check.)
+  lambda_col <- paste0("hs_local[", idx, "]")
+  
+  if (lambda_col %in% colnames(post_draws)) {
+    lambda_draws <- post_draws[[lambda_col]]
+    # Calculate Shrinkage factor (Kappa): kappa = 1 / (1 + lambda^2)
+    # E[kappa_k|Y] summarizes posterior shrinkage toward zero.
+    kappa_draws <- 1 / (1 + lambda_draws^2)
+    mean_kappa <- mean(kappa_draws)
+  } else {
+    mean_kappa <- NA
+  }
+  # Merge with fixed-effect summaries.
+  fixed_info <- fixef_res %>% filter(Parameter == var_name)
+  
+  if(nrow(fixed_info) == 1) {
+    estimate <- fixed_info$Estimate
+    est_error <- fixed_info$Est.Error
+    q2.5 <- fixed_info$Q2.5
+    q97.5 <- fixed_info$Q97.5
+    # Calculate Signal-to-Noise Ratio (SNR)
+    # (SNR) = |E(gamma|Y) / SD(gamma|Y)|
+    snr <- abs(estimate / est_error)
+    # CrI excludes zero iff its two endpoints share the same sign.
+    exclude_zero <- sign(q2.5) == sign(q97.5)
+    
+    return(tibble(
+      Interaction_Term = var_name,
+      Estimate = estimate,
+      Est_Error = est_error,
+      Q2.5 = q2.5,
+      Q97.5 = q97.5,
+      SNR = snr,
+      Mean_Kappa = mean_kappa,
+      Exclude_Zero = exclude_zero,
+      # `Selected` encodes all three criteria jointly.
+      Selected = exclude_zero & (mean_kappa < 0.5) & (snr > 2) 
+    ))
+  }
+})
+
+# 5. Assemble and print.
+selection_results <- bind_rows(results_list)
+
+print("=== Horseshoe Prior Interaction Term Selection Results ===")
+print(selection_results %>% 
+        select(Interaction_Term, Estimate, Q2.5, Q97.5, SNR, Mean_Kappa, Exclude_Zero),
+      n = Inf)
+
+# Final selection.
+# Note: the filter below uses conditions (1) and (2) only; SNR (condition 3)
+# is already satisfied for the retained set (SEX: 15.1, CPEPTIDE: 6.48,
+# URICACID: 2.65), so results do not change.
+final_selected <- selection_results %>% filter(Exclude_Zero == TRUE & Mean_Kappa < 0.5)
+print("=== Final Selected Interaction Terms ===")
+print(final_selected$Interaction_Term)
+```
+
+# III. Main Model Fitting
+```{r}
+# ------------------------------------------------------------------------------
+# Fit the final BLMM using only the 3 interactions retained from Section II:
+#   SEX x TIME, URICACID x TIME, CPEPTIDE x TIME.
+# All 8 main effects (including those whose interactions were dropped) remain.
+# ------------------------------------------------------------------------------
+
+library(brms)
+
+# Final model formula.
+# Note: SYSMEAN here == SBP in the manuscript.
+formm<-as.formula(
+    paste("eGFR ~  RelativeYear + SEX + AGE + BMI + BUN + URICACID + HOMOCYST_log + CPEPTIDE",
+    "+ RelativeYear:CPEPTIDE",
+    "+ RelativeYear:URICACID",
+    "+ RelativeYear:SEX",
+    "+ SYSMEAN + (1 + RelativeYear |ID)"
+))
+
+
+# Weakly informative priors (Model 1 in the prior sensitivity analysis; §V).
+# All Student-t_3 / Half-t_3: heavy-tailed, avoids IG pathologies.
+priorss <- c(
+    set_prior("student_t(3,0,5)", class = "b"),             
+    set_prior("student_t(3,0,10)", class = "Intercept"),
+    set_prior("student_t(3,0,5)", class = "sd"),
+    set_prior("lkj(2)",           class = "cor"),
+    set_prior("student_t(3,0,10)", class = "sigma")
+)
+
+# Fitting wrapper. iter=8000 / warmup=2000 is sufficient for this well-posed
+# model (the funnel geometry of the horseshoe hierarchy is no longer present).
+fit_model <- function(formula, data_input, priors_input) {
+    brm(
+        formula = formula,
+        data = data_input, # real train data (eg. train_df)
+        prior = priors_input,
+        family = gaussian(),
+        chains = 4, cores = 2,
+        iter = 8000, warmup = 2000,
+        seed = 123,
+        control = list(adapt_delta = 0.99, max_treedepth = 12),
+        save_pars = save_pars(all = TRUE)
+
+    )
+}
+
+# Fit the main BLMM.
+fit1<-fit_model(formm, train_df1, priorss)
+summary(fit1)
+# saveRDS(fit1,'/Users/minjaejung/Desktop/2026/학술지/Revision_0413/fit_final.rds')
+```
+
+# IV. Prediction & Validation
+## Define the function 'predict_with_posterior_update'
+```{r}
+# ------------------------------------------------------------------------------
+# Personalized calibration via single-baseline-eGFR update
+# (Kammer et al., 2023; extended to a fully Bayesian posterior update here).
+#
+# Paper equations (§3.4):
+#   r_{i1}    = y_{i1} - x_{i1}^T beta
+#   w         = tau_0^2 / (tau_0^2 + sigma^2)
+#   E[b_{0i} | y_{i1}] = w * r_{i1}
+#   E[b_{1i} | y_{i1}] = (tau_01 / (tau_0^2 + sigma^2)) * r_{i1}
+#
+# We apply these updates draw-by-draw across all MCMC iterations so that
+# parameter uncertainty propagates into the credible intervals of personalized
+# predictions -- strictly more honest than plug-in point estimates.
+# ------------------------------------------------------------------------------
+
+library(brms)
+library(dplyr)
+library(purrr)
+library(tibble)
+
+# Helper: assign Time_Sequence in {1, 2, 3} in ascending visit order,
+# restricted to subjects with exactly 3 visits. (The training/test data are
+# constructed to have 3 consecutive waves per subject; this guards against
+# accidental violations.)
+
+make_time_seq_rel <- function(dat){
+    # 1. Sort by ID and count visits per subject.
+    temp_dat <- dat %>%
+        group_by(ID) %>%
+        arrange(RelativeYear) %>%
+        mutate(n_visits = n())
+    
+    # 2. Defensive filter: drop any ID that does not have exactly 3 visits.
+    if (any(temp_dat$n_visits != 3)) {
+        warning("Some IDs do not have exactly 3 visits; excluded from evaluation.")
+        temp_dat <- temp_dat %>% filter(n_visits == 3)
+    }
+    
+    # 3. Assign sequence indices 1/2/3 to min/median/max RelativeYear.
+    temp_dat %>%
+        mutate(
+            rel_min = first(RelativeYear),
+            rel_max = last(RelativeYear),
+            # With n_visits == 3 guaranteed, the median visit is the 2nd.
+            rel_med = RelativeYear[2], 
+            
+            Time_Sequence = case_when(
+                RelativeYear == rel_min ~ 1,
+                RelativeYear == rel_med ~ 2,
+                RelativeYear == rel_max ~ 3,
+                TRUE ~ NA_real_
+            )
+        ) %>%
+        ungroup() %>%
+        filter(!is.na(Time_Sequence))
+}
+
+# Main prediction function: returns both pre-update (marginal) and
+# post-update (personalized) linear predictors as draws x n matrices.
+predict_with_posterior_update <- function(fit, newdata, id_col = "ID",
+                                          time_col = "RelativeYear",
+                                          outcome_col = "eGFR",
+                                          baseline_rule = c("min")) {
+    stopifnot(inherits(fit, "brmsfit"))
+    baseline_rule <- match.arg(baseline_rule)
+
+    # 1. Baseline row per subject: the earliest RelativeYear (defines t_{i1}=0
+    #    in the paper's notation; in the data, RelativeYear is already
+    #    centered per subject so min(RelativeYear) == 0).
+    base_nd <- newdata %>%
+        group_by(.data[[id_col]]) %>%
+        slice_min(.data[[time_col]], with_ties = FALSE) %>%
+        ungroup()
+
+    # 2. Fixed-effect linear predictors (re_formula = NA drops random effects)
+    #    -- draws x n matrices.
+    #    lp_fixed_all : at all time points in `newdata`
+    #    lp_fixed_base: at the baseline row of each subject
+    lp_fixed_all <- brms::posterior_linpred(fit, newdata = newdata, re_formula = NA, transform = FALSE)
+    lp_fixed_base <- brms::posterior_linpred(fit, newdata = base_nd, re_formula = NA, transform = FALSE)
+
+    # 3. Extract variance components as draw-level vectors.
+    post <- as_draws_df(fit)
+    sig_eps <- post[["sigma"]]
+    sd0    <- post[["sd_ID__Intercept"]]
+    sd1    <- post[["sd_ID__RelativeYear"]]
+    
+    # Random-effect correlation rho (fallback to 0 if absent).
+    if ("cor_ID__Intercept__RelativeYear" %in% names(post)) {
+        rho01 <- post[["cor_ID__Intercept__RelativeYear"]]
+    } else {
+        rho01 <- rep(0, length(sd0))
+        message("[info] cor_ID__Intercept__RelativeYear not found → assumed 0 (independent random effects).")
+    }
+
+    cov01 <- rho01 * sd0 * sd1
+    var0  <- sd0^2
+    var_eps <- sig_eps^2
+
+    # 4. Baseline residuals r_{i1}^{(s)} = y_{i1} - x_{i1}^T beta^{(s)}
+    #    -- draws x n_subj matrix.
+    y0 <- base_nd[[outcome_col]]
+    id_levels <- base_nd[[id_col]]
+    resid_base <- sweep(lp_fixed_base, 2, y0, FUN = function(hat, y) y - hat)
+
+    # 5. Per-draw posterior update of random effects.
+    #    b0_draws = w * resid_base, where w = var0 / (var0 + var_eps)  [paper eq.]
+    #    b1_draws = b0_draws * (cov01 / var0)
+    #
+    #    NOTE on algebraic equivalence:
+    #      b1_draws
+    #      = b0_draws * (cov01 / var0)
+    #      = resid_base * (var0 / (var0 + var_eps)) * (cov01 / var0)
+    #      = resid_base * cov01 / (var0 + var_eps)
+    #    which matches E[b_{1i}|y_{i1}] = (tau_01 / (tau_0^2 + sigma^2)) * r_{i1}
+    #    exactly. The two-step factorization just reuses b0_draws.
+    denom <- var0 + var_eps
+    b0_draws <- sweep(resid_base, 1, var0 / denom, `*`)
+    b1_draws <- sweep(b0_draws,   1, cov01 / var0, `*`)
+
+    # 6. Broadcast per-subject random effects back to per-observation columns.
+    nd <- newdata %>%
+        mutate(.row_id = row_number()) %>%
+        select(.row_id, any_of(c(id_col, time_col, "Time_Sequence")))
+
+    base_map <- base_nd %>%
+        mutate(.base_row = row_number()) %>%
+        select(all_of(id_col), .base_row)
+
+    nd <- nd %>% left_join(base_map, by = id_col)
+    
+    # 7. Assemble personalized predictions:
+    #    y_tilde^{(s)}_{ij} = x_{ij}^T beta^{(s)}
+    #                         + E^{(s)}[b_{0i} | y_{i1}]
+    #                         + E^{(s)}[b_{1i} | y_{i1}] * t_{ij}
+    draws <- nrow(lp_fixed_all)
+    b0_all <- b0_draws[, nd$.base_row, drop = FALSE]
+    b1_all <- b1_draws[, nd$.base_row, drop = FALSE]
+    time_vec <- matrix(rep(nd[[time_col]], each = draws), nrow = draws)
+
+    lp_updated_all <- lp_fixed_all + b0_all + b1_all * time_vec
+
+    list(
+        fixed_linear = lp_fixed_all, # marginal (pre-update) predictions
+        updated_linear = lp_updated_all,  # personalized (post-update) predictions
+        newdata_index = nd,
+        baseline_index = base_nd,
+        sigma_draws = sig_eps
+    )
+}
+
+# ----------------------------------------------------------------------
+# Point error metrics (uses posterior mean of predictions as point est.)
+# ----------------------------------------------------------------------
+point_metrics <- function(y, yhat, p){
+    ok <- is.finite(y) & is.finite(yhat)
+    y <- y[ok]; yhat <- yhat[ok]
+    n <- length(y)
+    sse <- sum((y - yhat)^2)
+    sst <- sum((y - mean(y))^2)
+    r2  <- 1 - sse/sst
+    
+    # P30 / P10: percentage of predictions within 30% / 10% of the observed
+    # value -- commonly reported alongside eGFR prediction studies.
+    p30_val <- mean(abs((y - yhat) / y) < 0.3) * 100
+    p10_val <- mean(abs((y - yhat) / y) < 0.1) * 100
+
+    tibble(
+        RMSE   = sqrt(sse/n),
+        MAE    = mean(abs(y - yhat)),
+        P30    = p30_val,  # Unit: %
+        P10 = p10_val,
+        R2     = r2,
+        Adj_R2 = 1 - (1 - r2) * (n - 1)/(n - p - 1)
+    )
+}
+
+# ----------------------------------------------------------------------
+# Bayesian R^2 (Gelman, Goodrich, Gabry, Ali, 2019)
+#   R2^{(s)} = Var(y_hat^{(s)}) / (Var(y_hat^{(s)}) + sigma^{2(s)})
+# Computed per draw; returned as posterior mean and 95% CrI.
+#
+# Caveat: sigma^{(s)} here is the model's residual SD (population-level),
+# not the residual left after personalized updating. Interpret accordingly.
+# ----------------------------------------------------------------------
+bayesR2_from_draws <- function(yhat_draws, sigma_draws){
+    # yhat_draws: draws × n, sigma_draws: draws
+    var_yhat <- matrixStats::rowVars(yhat_draws)
+    R2_s     <- var_yhat / (var_yhat + sigma_draws^2)
+    tibble(
+        mean  = mean(R2_s),
+        q2.5  = stats::quantile(R2_s, 0.025),
+        q97.5 = stats::quantile(R2_s, 0.975)
+    )
+}
+
+
+# ----------------------------------------------------------------------
+# Combined evaluator: overall + per-time-point point metrics & Bayesian R^2
+# for both "Before" (marginal) and "After" (personalized) predictions.
+# ----------------------------------------------------------------------
+eval_three_timepoints_rel_bayes <- function(fit, test_df){
+    require(dplyr)
+    require(matrixStats)
+    # (a) Restrict to subjects with 3 visits and assign sequence indices.
+    dat_ts <- make_time_seq_rel(test_df)
+    
+    # (b) Run the personalized-calibration predictor.
+    pred <- predict_with_posterior_update(fit, dat_ts, id_col = "ID", time_col = "RelativeYear")
+    
+    # (c) Point predictions = posterior mean across draws.
+    mu_before <- colMeans(pred$fixed_linear)    # length of n_all
+    mu_after  <- colMeans(pred$updated_linear)
+    
+    # Number of fixed effects for Adjusted R^2.
+    p <- nrow(fixef(fit)) - 1
+    
+    # observed eGFR
+    y <- dat_ts$eGFR
+    
+    overall_before <- point_metrics(y, mu_before, p) %>% mutate(Time = "All", Type = "Before")
+    overall_after  <- point_metrics(y, mu_after,  p) %>% mutate(Time = "All", Type = "After")
+    
+    # (d) Bayesian R^2, overall (Before / After).
+    idx_all <- pred$newdata_index
+    split_ids <- split(seq_len(nrow(idx_all)), idx_all$Time_Sequence)
+    
+    bayesR2_before_overall <- bayesR2_from_draws(pred$fixed_linear,  pred$sigma_draws) %>% mutate(Time="All", Type="Before")
+    bayesR2_after_overall  <- bayesR2_from_draws(pred$updated_linear, pred$sigma_draws) %>% mutate(Time="All", Type="After")
+    
+    # Label map for the three visit indices.
+    time_labels <- c("1" = "Baseline", "2" = "Follow-up 1", "3" = "Follow-up 2")
+    
+    # (e) Per-time-point point metrics.
+    by_time_tbl <- purrr::imap_dfr(split_ids, function(cols, k){
+        yk <- y[cols]
+        mu_b <- mu_before[cols]
+        mu_a <- mu_after[cols]
+        
+        tibble::tibble(
+            bind_rows(
+                point_metrics(yk, mu_b, p) %>% mutate(Type="Before"),
+                point_metrics(yk, mu_a, p) %>% mutate(Type="After")
+            )
+        ) %>% mutate(Time = time_labels[k])
+    })
+    
+    # Per-time-point Bayesian R^2.
+    bayesR2_by_time <- purrr::imap_dfr(split_ids, function(cols, k){
+        tibble::tibble(
+            bind_rows(
+                bayesR2_from_draws(pred$fixed_linear[, cols, drop=FALSE],  pred$sigma_draws) %>% mutate(Type="Before"),
+                bayesR2_from_draws(pred$updated_linear[, cols, drop=FALSE], pred$sigma_draws) %>% mutate(Type="After")
+            )
+        ) %>% mutate(Time = time_labels[k])
+    })
+    
+    list(
+        overall_point = bind_rows(overall_before, overall_after),
+        overall_bayesR2 = bind_rows(bayesR2_before_overall, bayesR2_after_overall),
+        by_time_point = by_time_tbl,
+        by_time_bayesR2 = bayesR2_by_time
+    )
+}
+```
+
+## Prediction results
+```{r}
+# Evaluate the final fit on the held-out test set.
+res_final <- eval_three_timepoints_rel_bayes(fit1, test_df1)
+print(res_final)
+```
+
+## Visualization: predicted vs observed
+```{r}
+# ------------------------------------------------------------------------------
+# Scatterplots of observed vs predicted eGFR at each visit, comparing the
+# marginal prediction ("Before") to the personalized update ("After").
+# Agreement with the 45-degree line indicates good calibration.
+# ------------------------------------------------------------------------------
+# Convenience wrapper around posterior_linpred for marginal predictions.
+
+library(tidyverse)
+predict_marginal <- function(fit, newdata, id_col, time_col) {
+    
+    # Fixed-effect linear predictor draws; re_formula = NA drops random effects.
+    linpred_fixed <- brms::posterior_linpred(
+        fit,
+        newdata = newdata,
+        re_formula = NA,
+        transform = FALSE
+    )
+    
+    # Point estimate = posterior mean.
+    pred <- apply(linpred_fixed, 2, mean)
+    
+    return(list(
+        pred = pred,
+        linpred_draws = linpred_fixed
+    ))
+}
+
+# Marginal predictions on the test set.
+lp_marg <- brms::posterior_linpred(fit1, newdata = test_df1, re_formula = NA)
+test_df1$pred_marg <- apply(lp_marg, 2, mean)
+
+# Personalized (updated) predictions on the test set.
+updated_pred <- predict_with_posterior_update(
+    fit = fit1,
+    newdata = test_df1,
+    id_col = "ID",
+    time_col = "RelativeYear",
+    outcome_col = "eGFR"
+)
+
+test_df1$pred_updated <- apply(updated_pred$updated_linear, 2, mean)
+
+# Assign Baseline / Follow-up 1 / Follow-up 2 labels in visit order.
+test_df1 <- test_df1 %>%
+  group_by(ID) %>%
+  arrange(RelativeYear) %>%
+  mutate(
+    FU = case_when(
+      row_number() == 1 ~ "Baseline",
+      row_number() == 2 ~ "Follow-up 1",
+      row_number() >= 3 ~ "Follow-up 2"
+    )
+  ) %>%
+  ungroup()
+
+test_df1$FU <- factor(
+  test_df1$FU,
+  levels = c("Baseline", "Follow-up 1", "Follow-up 2")
+)
+
+# Long format for ggplot faceting.
+df_long <- test_df1 %>%
+    select(ID, RelativeYear, eGFR, FU, pred_marg, pred_updated) %>% 
+    pivot_longer(
+        cols = c(pred_marg, pred_updated),
+        names_to = "PredType",
+        values_to = "PredValue"
+    ) %>%
+    mutate(
+        PredType = recode(PredType,
+                          pred_marg = "Before",
+                          pred_updated = "After"
+        )
+    )
+
+df_long <- df_long %>%
+  mutate(
+    PredType = factor(
+      PredType,
+      levels = c("Before", "After")
+    )
+  )
+
+label_list <- c(
+    Before = "Before",
+  After  = "After"
+
+)
+
+library(ggplot2)
+
+ggplot(df_long, aes(x = PredValue, y = eGFR, color = FU)) +
+    geom_point(alpha = 0.35, size = 1.6) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+    facet_grid(
+        PredType ~ FU,
+        labeller = labeller(PredType = label_list)
+    ) +
+    labs(
+        x = "Predicted eGFR",
+        y = "Observed eGFR"
+    ) +
+    theme_bw(base_size = 13) +
+    theme(
+        panel.grid.minor = element_blank(),
+        strip.text = element_text(size = 12),
+        legend.position = "none"
+    )
+
+```
+
+
+# V. Prior Sensitivity Analysis
+## 6 model configurations
+```{r}
+# ------------------------------------------------------------------------------
+# Refit the main model under six prior configurations to check that
+# posterior inference is not driven by the specific prior choice.
+#
+# IMPORTANT TERMINOLOGY:
+#   In brms / Stan, `normal(mu, s)` uses s as the **standard deviation**.
+#   The manuscript writes "N(0, 75)" with 75 as the **variance**.
+#   Hence the code value `normal(0, 8.66)` corresponds to SD = sqrt(75) ~= 8.66,
+#   which is the variance-matched counterpart to student_t(3, 0, 5)
+#   (whose variance is s^2 * df/(df-2) = 25 * 3 = 75).
+#   Similarly, sqrt(300) ~= 17.32 for the t3(0, 10) match.
+#
+# Why the Normal-intercept prior is centered at 82, not 0:
+#   The Student-t_3 has heavy tails and effectively imposes only weak
+#   constraints far from 0. A Normal prior with the same variance has
+#   Gaussian tails that would be strongly informative against large
+#   intercept values. Since the baseline eGFR scale is ~82 mL/min/1.73m^2,
+#   we center the Normal intercept prior at 82 so that its mass covers the
+#   plausible range for the data-generating process, keeping the comparison
+#   with Student-t fair.
+#
+# IG matching rationale:
+#   Var[t3(0, 5)] = 75 and mean(IG(2, 75)) = 75 / (2 - 1) = 75
+#   Var[t3(0, 10)] = 300 and mean(IG(2, 300)) = 300 / (2 - 1) = 300
+#   so "matched IG" has mean equal to the second moment of the half-t.
+# ------------------------------------------------------------------------------
+
+library(brms)
+
+# Same model formula as the main fit.
+formm<-as.formula(
+    paste("eGFR ~  RelativeYear + SEX + AGE + BMI + BUN + URICACID + HOMOCYST_log + CPEPTIDE",
+    "+ RelativeYear:CPEPTIDE",
+    "+ RelativeYear:URICACID",
+    "+ RelativeYear:SEX",
+    "+ SYSMEAN + (1 + RelativeYear |ID)"
+))
+
+# Wrapper accepting optional stanvars for custom (Inverse-Gamma) priors that
+# brms cannot express directly.
+fit_model <- function(formula, data_input, priors_input, stanvars_input = NULL) {
+    brm(
+        formula = formula,
+        data = data_input, 
+        prior = priors_input,
+        stanvars = stanvars_input,
+        family = gaussian(),
+        chains = 4, cores = 2,
+        iter = 8000, warmup = 2000,
+        seed = 123,
+        control = list(adapt_delta = 0.99, max_treedepth = 12),
+        save_pars = save_pars(all = TRUE)
+    )
+}
+
+
+# ==============================================================================
+# Prior specifications
+# ==============================================================================
+# Model 1: Proposed (t3 for coefficients & Half-t3 for SDs).
+prior_m1 <- c(
+    set_prior("student_t(3, 0, 5)",  class = "b"),
+    set_prior("student_t(3, 0, 10)", class = "Intercept"),
+    set_prior("student_t(3, 0, 5)",  class = "sd"),
+    set_prior("lkj(2)",              class = "cor"),
+    set_prior("student_t(3, 0, 10)", class = "sigma")
+)
+# Model 2: Variance-matched Normal for coefficients, Half-t3 for SDs.
+# Intercept centered at 82 (baseline eGFR scale) -- see header note.
+prior_m2 <- c(
+    set_prior("normal(0, 8.66)",    class = "b"),
+    set_prior("normal(82, 17.32)",  class = "Intercept"), # 수정됨
+    set_prior("student_t(3, 0, 5)", class = "sd"),
+    set_prior("lkj(2)",             class = "cor"),
+    set_prior("student_t(3, 0, 10)",class = "sigma")
+)
+
+
+# Model 3: t3 for coefficients, matched Inverse-Gamma for variances.
+# IG priors are applied on sigma^2 and sd_1^2 via stanvars (below).
+# Empty priors for sd/sigma tell brms to skip its default and use stanvars.
+prior_m3_base <- c(
+    set_prior("student_t(3, 0, 5)",  class = "b"),
+    set_prior("student_t(3, 0, 10)", class = "Intercept"),
+    set_prior("lkj(2)",              class = "cor"),
+    set_prior("", class = "sd"),    
+    set_prior("", class = "sigma")  
+)
+
+# Matched IG on the variance scale. `log(2 * sigma)` and `log(2 * sd_1[n])`
+# are Jacobian adjustments for the parameterization change from variance to
+# SD (brms parameterizes in SD; we declare an IG on variance).
+stanvars_matched_IG <- stanvar(scode = "
+  target += inv_gamma_lpdf(square(sigma) | 2, 300) + log(2 * sigma);
+  for (n in 1:M_1) {
+    target += inv_gamma_lpdf(square(sd_1[n]) | 2, 75) + log(2 * sd_1[n]);
+  }
+", block = "model")
+
+# Model 4: matched Normal for coefficients & matched IG for variances.
+prior_m4_base <- c(
+    set_prior("normal(0, 8.66)",    class = "b"),
+    set_prior("normal(82, 17.32)",  class = "Intercept"), # 수정됨
+    set_prior("lkj(2)",             class = "cor"),
+    set_prior("", class = "sd"),    
+    set_prior("", class = "sigma")  
+)
+
+# Model 5: t3 for coefficients & non-informative IG(0.01, 0.01) for variances.
+prior_m5_base <- prior_m3_base
+
+stanvars_noninfo_IG <- stanvar(scode = "
+  target += inv_gamma_lpdf(square(sigma) | 0.01, 0.01) + log(2 * sigma);
+  for (n in 1:M_1) {
+    target += inv_gamma_lpdf(square(sd_1[n]) | 0.01, 0.01) + log(2 * sd_1[n]);
+  }
+", block = "model")
+
+# Model 6: t3 & Weakly Informative Inverse-Gamma IG(1, 1)
+prior_m6_base <- prior_m3_base
+
+stanvars_mild_IG <- stanvar(scode = "
+  target += inv_gamma_lpdf(square(sigma) | 1, 1) + log(2 * sigma);
+  for (n in 1:M_1) {
+    target += inv_gamma_lpdf(square(sd_1[n]) | 1, 1) + log(2 * sd_1[n]);
+  }
+", block = "model")
+
+
+# ==============================================================================
+# Fit and cache all six models
+# ==============================================================================
+# Replace `save_dir` with a local path before running.
+save_dir <- "/Users/minjaejung/Desktop/2026/학술지/Revision_0413"
+dir.create(save_dir, showWarnings = FALSE)
+
+cat("Fitting Model 1...\n")
+fit_m1 <- fit_model(formm, train_df1, prior_m1)
+saveRDS(fit_m1, file.path(save_dir, "Model1.rds"))
+
+cat("Fitting Model 2...\n")
+fit_m2 <- fit_model(formm, train_df1, prior_m2)
+saveRDS(fit_m2, file.path(save_dir, "Model2.rds"))
+
+cat("Fitting Model 3...\n")
+fit_m3 <- fit_model(formm, train_df1, prior_m3_base, stanvars_input = stanvars_matched_IG)
+saveRDS(fit_m3, file.path(save_dir, "Model3.rds"))
+
+cat("Fitting Model 4...\n")
+fit_m4 <- fit_model(formm, train_df1, prior_m4_base, stanvars_input = stanvars_matched_IG)
+saveRDS(fit_m4, file.path(save_dir, "Model4.rds"))
+
+cat("Fitting Model 5...\n")
+fit_m5 <- fit_model(formm, train_df1, prior_m5_base, stanvars_input = stanvars_noninfo_IG)
+saveRDS(fit_m5, file.path(save_dir, "Model5.rds"))
+
+cat("Fitting Model 6...\n")
+fit_m6 <- fit_model(formm, train_df1, prior_m6_base, stanvars_input = stanvars_mild_IG)
+saveRDS(fit_m6, file.path(save_dir, "Model6.rds"))
+
+cat("All 6 models have been successfully fitted and saved to:", save_dir, "\n")
+
+```
+
+
+##    Posterior density comparison plots
+```{r}
+# ------------------------------------------------------------------------------
+# Overlay marginal posterior densities of each fixed-effect parameter across
+# the six prior configurations. If the curves coincide, posterior inference
+# is robust to the prior choice.
+# ------------------------------------------------------------------------------
+
+library(brms)
+library(posterior)
+library(tidyverse)
+library(patchwork)
+
+# 1. Collect all fitted models.
+fit_list <- list(
+    "Model 1" = fit_m1,
+    "Model 2" = fit_m2,
+    "Model 3" = fit_m3,
+    "Model 4" = fit_m4,
+    "Model 5" = fit_m5,
+    "Model 6" = fit_m6
+)
+
+# 2. Target fixed-effect parameter names (brms uses the 'b_' prefix).
+target_vars <- c(
+    "b_Intercept", "b_RelativeYear", "b_SEXMale", "b_AGE", "b_BMI", 
+    "b_BUN", "b_URICACID", "b_HOMOCYST_log", "b_CPEPTIDE", "b_SYSMEAN", 
+    "b_RelativeYear:CPEPTIDE", "b_RelativeYear:URICACID", "b_RelativeYear:SEXMale"
+)
+
+# 3. Extract draws from each model, tagging with a Model column.
+draws_list <- lapply(names(fit_list), function(m_name) {
+    fit <- fit_list[[m_name]]
+    
+    # Extract draws using as_draws_df(), select target variables, and add a Model identifier column
+    draws <- as_draws_df(fit) %>%
+        as_tibble() %>%
+        select(any_of(target_vars)) %>%
+        mutate(Model = m_name)
+    
+    return(draws)
+})
+
+# Bind the list of dataframes into one
+all_draws <- bind_rows(draws_list)
+
+# 4. Wide -> long, and strip the 'b_' prefix for nicer axis labels.
+draws_long <- all_draws %>%
+    pivot_longer(cols = starts_with("b_"), names_to = "Parameter", values_to = "Value") %>%
+    mutate(Parameter = str_remove(Parameter, "^b_"))
+
+params_to_plot <- c(
+    "Intercept", "RelativeYear", "SEXMale", "AGE", "BMI", "BUN", 
+    "URICACID", "HOMOCYST_log", "CPEPTIDE", "SYSMEAN", 
+    "RelativeYear:CPEPTIDE", "RelativeYear:URICACID", "RelativeYear:SEXMale"
+)
+
+# 5. For each parameter: two side-by-side density plots.
+#    Left  panel = Models 1,2,3,4 (varies coefficient prior; matched variance prior)
+#    Right panel = Models 1,5,6   (varies variance prior; fixed coefficient prior)
+for (param in params_to_plot) {
+    
+    # Filter data for the current parameter
+    param_data <- draws_long %>% filter(Parameter == param)
+    
+    if(nrow(param_data) == 0) {
+        message(paste("Skipping", param, "- no data found."))
+        next
+    }
+    
+    # Left: effect of different coefficient priors.
+    plot1 <- param_data %>%
+        filter(Model %in% c("Model 1", "Model 2", "Model 3", "Model 4")) %>%
+        ggplot(aes(x = Value, fill = Model, color = Model)) +
+        geom_density(alpha = 0.4, linewidth = 0.8) +
+        labs(title = "Models 1, 2, 3, 4", x = "Estimate (Posterior)", y = "Density") +
+        theme_minimal() +
+        scale_fill_viridis_d() + scale_color_viridis_d() +
+        theme(legend.position = "bottom")
+    
+    # Right: effect of different Inverse-Gamma specifications on variances.
+    plot2 <- param_data %>%
+        filter(Model %in% c("Model 1", "Model 5", "Model 6")) %>%
+        ggplot(aes(x = Value, fill = Model, color = Model)) +
+        geom_density(alpha = 0.4, linewidth = 0.8) +
+        labs(title = "Models 1, 5, 6", x = "Estimate (Posterior)", y = "") +
+        theme_minimal() +
+        scale_fill_brewer(palette = "Set1") + scale_color_brewer(palette = "Set1") +
+        theme(legend.position = "bottom")
+    
+    # --- Combine plots using the patchwork package ---
+    combined_plot <- plot1 + plot2 + 
+        plot_annotation(
+            title = paste("Prior Sensitivity Analysis:", param),
+            subtitle = "Comparison of Posterior Distributions across models"
+        )
+    
+    # Display the plot in the R environment
+    print(combined_plot)
+    
+    # Save as PNG. Replace ':' in names to keep filenames filesystem-safe.
+    safe_name <- gsub(":", "_", param)
+    file_name <- paste0("Posterior_Density_", safe_name, ".png")
+    
+    ggsave(filename = file_name, plot = combined_plot, 
+           width = 12, height = 6, dpi = 300)
+}
+
+message("Posterior density visualization and saving completed for all parameters.")
+```
+
+
+##    Predictive performance across configurations
+```{r}
+# Re-run the evaluator on the held-out test set for each of the 6 models.
+# If all six yield nearly identical metrics, posterior predictive inference
+# is robust to the prior configuration.
+res1 <- eval_three_timepoints_rel_bayes(fit_m1, test_df1)
+print(res1)
+res2 <- eval_three_timepoints_rel_bayes(fit_m2, test_df1)
+print(res2)
+res3 <- eval_three_timepoints_rel_bayes(fit_m3, test_df1)
+print(res3)
+res4 <- eval_three_timepoints_rel_bayes(fit_m4, test_df1)
+print(res4)
+res5 <- eval_three_timepoints_rel_bayes(fit_m5, test_df1)
+print(res5)
+res6 <- eval_three_timepoints_rel_bayes(fit_m6, test_df1)
+print(res6)
+```
+
+
+# VI. Clinical Application (Rapid Decliner Identification)
+```{r}
+# ------------------------------------------------------------------------------
+# Prospective validation: can the BLMM, fitted to waves 4-6, identify
+# individuals who become rapid decliners in later waves?
+#
+# Observed slope definition:
+#   obs_slope = (eGFR_last - eGFR_baseline) / (t_last - t_baseline)
+# where t_baseline = wave 4 and t_last is the subject's latest observation
+# among waves 7 and 8. Waves 9-10 are EXCLUDED because the creatinine assay
+# and reagent were changed starting from wave 9, breaking comparability with
+# the training data. Waves 5-6 are excluded because they are already in the
+# training set.
+#
+# Predictor:
+#   For each subject i, posterior draws of the individual slope
+#       slope_i^{(s)} = beta_1^{(s)} + b_{1i}^{(s)} + Z_i^T gamma^{(s)}
+#   are used to compute Pr(slope_i < c | Y) for c in {-2, -3}. This
+#   probability is then used as a continuous predictor in an ROC analysis
+#   against the observed-slope indicator.
+#
+# Prerequisites (objects expected to be in the workspace):
+#   - train_df1, test_df1  : training / test data
+#   - fit1                 : main BLMM fit (from Section III)
+#   - combined_data        : long-term eGFR follow-up (waves 7-8)
+# ------------------------------------------------------------------------------
+```
+
+## Long-term slope estimation
+```{r}
+
+
+library(dplyr)
+library(purrr)
+library(brms)
+library(tibble)
+
+
+# ----------------------------------------------------------------------
+# (1) Build the prediction dataset:
+#     - Baseline covariates taken from train_df (wave 4 row per subject).
+#     - Long-term eGFR observations from combined_data (waves 7-8).
+#     - "eGFR" column of newdata_pred is set to the BASELINE eGFR so that
+#       predict_with_posterior_update() uses it for the single-obs update.
+# ----------------------------------------------------------------------
+
+make_newdata_for_prediction <- function(train_df, combined_data){
+    
+    # Baseline covariates + baseline eGFR, renamed to avoid collisions.
+    base_cov <- train_df %>%
+        group_by(ID) %>%
+        slice_min(RelativeYear, with_ties = FALSE) %>%
+        ungroup()
+    
+    base_cov <- base_cov %>% 
+        rename(eGFR_baseline = eGFR,
+               RelativeYear_baseline = RelativeYear)
+    
+    # Keep only IDs that appear in BOTH training and long-term follow-up.
+    valid_ids <- intersect(unique(train_df$ID), unique(combined_data$ID))
+    
+    combined_sub <- combined_data %>%
+        filter(ID %in% valid_ids)
+    
+    # Join baseline covariates onto every long-term row.
+    newdata <- combined_sub %>%
+        left_join(base_cov, by = "ID") %>%
+        arrange(ID, RelativeYear)
+    
+    # Ground-truth long-term eGFR for evaluation.
+    observed <- newdata %>%
+        select(ID, RelativeYear, eGFR)
+    
+   # Predictor frame: overwrite eGFR with baseline eGFR so it is the
+   # single-observation calibration input. Time_Sequence = 1 flags this
+   # baseline row for internal code that relies on the label.
+    newdata_pred <- newdata %>%
+        rename(eGFR_longterm = eGFR) %>%
+        select(-eGFR_longterm) %>%        
+        mutate(eGFR = eGFR_baseline,       
+               RelativeYear = RelativeYear,
+               Time_Sequence = 1    
+        )
+    
+    return(list(
+        observed = observed,
+        newdata_pred = newdata_pred
+    ))
+}
+
+# -------------------------------------------------------------
+# (2) Personalized prediction at long-term time points.
+# -------------------------------------------------------------
+predict_longterm_bayes <- function(fit, train_df, combined_data){
+    
+    nd <- make_newdata_for_prediction(train_df, combined_data)
+    newdata_pred <- nd$newdata_pred
+    observed      <- nd$observed
+    
+    # Posterior-updated prediction (reuses Section IV machinery).
+    pred <- predict_with_posterior_update(
+        fit,
+        newdata = newdata_pred,
+        id_col = "ID",
+        time_col = "RelativeYear"
+    )
+    
+    # Point estimate = posterior mean.
+    mu_after <- colMeans(pred$updated_linear)
+    
+    # Attach observed values for downstream comparison.
+    out <- newdata_pred %>%
+        mutate(pred_eGFR = mu_after) %>%
+        left_join(observed, by = c("ID","RelativeYear")) %>%
+        rename(obs_eGFR = eGFR.y)
+    
+    return(out)
+}
+
+longterm_result <- predict_longterm_bayes(
+    fit = fit1,
+    train_df = train_df1,
+    combined_data = combined_data
+)
+
+
+# ----------------------------------------------------------------------
+# (3) Build posterior draws of each subject's individual slope:
+#         slope_i^{(s)} = beta_1^{(s)} + b_{1i}^{(s)} + Z_i^T gamma^{(s)}
+#     We then compute Pr(slope_i < c | Y) by Monte Carlo averaging.
+# ----------------------------------------------------------------------
+library(brms)
+library(dplyr)
+library(purrr)
+library(tibble)
+
+# Posterior draws from the main fit.
+post <- as_draws_df(fit1)
+
+# Population slope(β₁) (length = n_draws).
+b_rel <- post[["b_RelativeYear"]]
+
+# Interaction coefficients gamma (length = n_draws each).
+b_sex_time <- post[["b_RelativeYear:SEXMale"]] 
+b_uric_time <- post[["b_RelativeYear:URICACID"]]
+b_cpep_time <- post[["b_RelativeYear:CPEPTIDE"]]
+
+# Random slope matrix r_ID[i, RelativeYear]: draws x n_subj.
+sl_cols <- grep("^r_ID\\[.*,RelativeYear\\]$", names(post), value = TRUE)
+rand_sl_mat <- as.matrix(post[, sl_cols])
+
+# Recover subject IDs from column names in brms' r_ID[..] format.
+id_vec <- sl_cols |>
+    sub("^r_ID\\[", "", x = _) |>
+    sub(",RelativeYear\\]$", "", x = _)
+
+# Align baseline covariates to id_vec order.
+base_cov_by_id <- train_df1 %>%
+    group_by(ID) %>%
+    slice_min(RelativeYear, with_ties = FALSE) %>%
+    ungroup() %>%
+    mutate(ID = as.character(ID)) %>%
+    filter(ID %in% id_vec) %>%
+    arrange(match(ID, id_vec))
+
+# SEX dummy (Female = 0, Male = 1). URICACID and CPEPTIDE are already
+# z-scored in train_df1 (done during preprocessing).
+sex_male <- as.integer(base_cov_by_id$SEX == "Male")
+uric_vec <- base_cov_by_id$URICACID 
+cpep_vec <- base_cov_by_id$CPEPTIDE
+
+# Assemble per-subject slope draws: (draws x n_subj).
+# fixed_slope       = beta_1^{(s)} + b_{1i}^{(s)}  (broadcast beta_1 across subjects)
+# interaction_contrib = sum over k of gamma_k^{(s)} * Z_{ik}
+fixed_slope <- sweep(rand_sl_mat, 1, b_rel, FUN = "+")
+
+interaction_contrib <- outer(b_sex_time, sex_male) +
+                       outer(b_uric_time, uric_vec) +
+                       outer(b_cpep_time, cpep_vec)
+
+slope_draws <- fixed_slope + interaction_contrib
+
+
+id_vec <- sl_cols |>
+    sub("^r_ID\\[", "", x = _) |>
+    sub(",RelativeYear\\]$", "", x = _)
+
+# Per-subject posterior summary and exceedance probabilities.
+slope_posterior_summary <- map_dfr(
+    seq_along(id_vec),
+    function(j){
+        s <- slope_draws[, j]
+        tibble(
+            ID          = id_vec[j],
+            slope_mean  = mean(s),
+            slope_median= median(s),
+            sd_slope    = sd(s),
+            pr_lt_2     = mean(s < -2),   # Pr(slope < -2)
+            pr_lt_3     = mean(s < -3),   # Pr(slope < -3)
+            pr_lt_5     = mean(s < -5)    # Pr(slope < -5) KDIGO rapid progression
+        )
+    }
+)
+
+# Optional posterior-probability flag (prob >= 0.80).
+slope_posterior_summary <- slope_posterior_summary %>%
+    mutate(
+        rapid2_80 = pr_lt_2 >= 0.80,
+        rapid3_80 = pr_lt_3 >= 0.80,
+        rapid5_80 = pr_lt_5 >= 0.80
+    )
+
+slope_posterior_summary
+
+
+# ----------------------------------------------------------------------
+# (4) Observed slope = simple two-point linear rate between baseline
+#     (wave 4) and the latest long-term observation (wave 7 or 8).
+# ----------------------------------------------------------------------
+obs_slope_df <- longterm_result %>%
+    group_by(ID) %>%
+    summarise(
+        time0      = first(RelativeYear_baseline),
+        eGFR0      = first(eGFR_baseline),
+        time_last  = max(RelativeYear),
+        eGFR_last  = obs_eGFR[which.max(RelativeYear)],
+        obs_slope  = (eGFR_last - eGFR0) / (time_last - time0)
+    ) %>%
+    ungroup()
+# Merge predicted probabilities with observed rapid-decliner labels.
+slope_compare <- slope_posterior_summary %>%
+    mutate(ID = as.character(ID)) %>%  
+    inner_join(
+        obs_slope_df %>% mutate(ID = as.character(ID)), 
+        by = "ID"
+    ) %>%
+    mutate(
+        rapid2_true = obs_slope <= -2,   # common epidemiological threshold
+        rapid3_true = obs_slope <= -3,   # common clinical threshold
+        rapid5_true = obs_slope <= -5    # KDIGO; effectively zero events in this cohort
+    )
+
+slope_compare
+
+library(dplyr)
+library(ggplot2)
+library(pROC)
+
+# Reference distribution of true labels (for context):
+# > table(slope_compare$rapid2_true)
+# 
+# FALSE  TRUE 
+#  1380   123 
+# > table(slope_compare$rapid3_true)
+# 
+# FALSE  TRUE 
+#  1477    26 
+# > table(slope_compare$rapid5_true)
+# 
+# FALSE  TRUE 
+#  1502     1 
+
+# NOTE: 5-unit threshold is too rare for a stable ROC; we report only
+# the -3 and -2 analyses below.
+
+# ROC analysis for the -3 threshold.
+dat_roc3 <- slope_compare %>%
+    filter(!is.na(pr_lt_3), !is.na(rapid3_true))
+
+roc3 <- roc(
+    response  = dat_roc3$rapid3_true,
+    predictor = dat_roc3$pr_lt_3,
+    quiet     = TRUE
+)
+
+auc3 <- auc(roc3)
+auc3
+# (reference) Area under the curve: ~0.809
+
+dat_roc2 <- slope_compare %>%
+    filter(!is.na(pr_lt_2), !is.na(rapid2_true))
+
+roc2 <- roc(
+    response  = dat_roc2$rapid2_true,
+    predictor = dat_roc2$pr_lt_2,
+    quiet     = TRUE
+)
+
+auc2 <- auc(roc2)
+auc2
+# (reference) Area under the curve: ~0.736
+```
+
+
+## ROC / AUC, Sensitivity, Specificity, NPV, PPV
+```{r}
+# ------------------------------------------------------------------------------
+# Extract the full set of classification metrics at the Youden-optimal
+# threshold (maximizes Sensitivity + Specificity - 1).
+#
+# Clinical note: in a low-prevalence setting (rapid decliners are 1.7% at
+# threshold -3 and 8.2% at -2), PPV is structurally low even when AUC and
+# NPV are strong. The model's useful role here is NPV-based: reliable
+# exclusion of rapid decline rather than positive identification.
+# ------------------------------------------------------------------------------
+library(pROC)
+library(caret)
+library(dplyr)
+
+# ============================================================
+# Function: compute metrics at the Youden-optimal threshold.
+# ============================================================
+get_performance_metrics <- function(response_vec, predictor_vec, target_label) {
+    
+    # 1. Build ROC object and compute AUC.
+    roc_obj <- roc(response = response_vec, predictor = predictor_vec, quiet = TRUE)
+    auc_val <- as.numeric(auc(roc_obj))
+    
+    # 2. Youden-optimal threshold. pROC's "best" returns the point(s)
+    #    maximizing sensitivity + specificity.
+    coords_best <- coords(roc_obj, "best", ret = c("threshold", "sensitivity", "specificity"), 
+                          transpose = FALSE)
+    
+    # If multiple optima, take the first.
+    best_thresh <- coords_best$threshold[1]
+    
+    # 3. Hard classification: predictor >= threshold ==> Positive.
+    pred_class <- factor(ifelse(predictor_vec >= best_thresh, TRUE, FALSE), levels = c("TRUE", "FALSE"))
+    true_class <- factor(response_vec, levels = c("TRUE", "FALSE"))
+    
+    # 4. Confusion matrix and summary metrics.
+    cm <- confusionMatrix(pred_class, true_class, positive = "TRUE")
+    
+    # 5. Collect into a named vector for compact reporting.
+    metrics <- c(
+        Target          = target_label,
+        AUC             = round(auc_val, 3),
+        Best_Threshold  = round(best_thresh, 3),
+        Sensitivity     = round(cm$byClass["Sensitivity"], 3),
+        Specificity     = round(cm$byClass["Specificity"], 3),
+        PPV             = round(cm$byClass["Pos Pred Value"], 3), # Precision
+        NPV             = round(cm$byClass["Neg Pred Value"], 3),
+        F1_Score        = round(cm$byClass["F1"], 3),
+        Accuracy        = round(cm$overall["Accuracy"], 3)
+    )
+    
+    return(metrics)
+}
+
+# ============================================================
+# Compute metrics for both rapid-decliner definitions.
+# ============================================================
+
+# Threshold -3 (standard clinical cutoff, rare events in this cohort).
+perf_rapid3 <- get_performance_metrics(
+    response_vec  = dat_roc3$rapid3_true,
+    predictor_vec = dat_roc3$pr_lt_3,
+    target_label  = "Rapid Decliner (<-3)"
+)
+
+# Threshold -2 (more sensitive definition, more events).
+perf_rapid2 <- get_performance_metrics(
+    response_vec  = dat_roc2$rapid2_true,
+    predictor_vec = dat_roc2$pr_lt_2,
+    target_label  = "Rapid Decliner (<-2)"
+)
+
+# ============================================================
+# Combine & Print Result Table
+# ============================================================
+final_perf_table <- rbind(perf_rapid3, perf_rapid2) %>% 
+    as.data.frame() %>%
+    remove_rownames() %>%
+    column_to_rownames("Target")
+
+print(final_perf_table)
+# Expected output (reference values):
+#                        AUC Best_Threshold Sensitivity Specificity    PPV    NPV F1_Score Accuracy
+# Rapid Decliner (<-3) 0.809          0.009       0.885       0.609  0.038  0.997    0.073    0.614
+# Rapid Decliner (<-2) 0.736          0.125       0.780       0.566  0.138  0.967    0.235    0.583
+
+# Optional: write to CSV for inclusion in the manuscript.
+# write.csv(final_perf_table, "Table3_Performance_Metrics.csv")
+```
+# End of analysis script.
+
